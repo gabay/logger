@@ -94,7 +94,14 @@ func TestNew_InvalidConfig(t *testing.T) {
 		{name: "nil config", cfg: nil, wantErr: "missing configuration"},
 		{name: "missing file", cfg: &Config{}, wantErr: "file is required"},
 		{name: "blank file", cfg: &Config{File: "  "}, wantErr: "file is required"},
-		{name: "bad format", cfg: &Config{File: file, Format: "{.Bad}"}, wantErr: "can't evaluate field Bad"},
+		{name: "bad format", cfg: &Config{File: file, Format: "{.Bad}"}, wantErr: "unknown field {.Bad}"},
+		{
+			name:    "bad trusted forwarder",
+			cfg:     &Config{File: file, TrustedForwarders: []string{"10.0.0.0/8", "not-an-ip"}},
+			wantErr: `invalid trusted forwarder "not-an-ip"`,
+		},
+		{name: "negative queue size", cfg: &Config{File: file, QueueSize: -1}, wantErr: "queueSize -1 must be between 1 and"},
+		{name: "huge queue size", cfg: &Config{File: file, QueueSize: MaxQueueSize + 1}, wantErr: "must be between 1 and"},
 		{
 			name:    "bad schedule",
 			cfg:     &Config{File: file, Rotate: &RotateConfig{Schedule: "every day"}},
@@ -209,6 +216,57 @@ func TestServeHTTP_FormatErrorSkipsLine(t *testing.T) {
 	}
 }
 
+func TestServeHTTP_ClientIp(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "access.log")
+	m := newTestMiddleware(t, &Config{
+		File:              file,
+		Format:            "{.Ip} {.ClientIp}",
+		TrustedForwarders: []string{"192.0.2.0/24", "10.0.0.0/8"},
+	}, nil)
+
+	requests := []struct {
+		remoteAddr string
+		headers    map[string][]string
+	}{
+		// Trusted peer: the first untrusted hop from the right is the client.
+		{"192.0.2.10:1234", map[string][]string{"X-Forwarded-For": {"203.0.113.9, 198.51.100.1, 10.0.0.5"}}},
+		// The header may be split across lines.
+		{"192.0.2.10:1234", map[string][]string{"X-Forwarded-For": {"198.51.100.2", "10.0.0.5"}}},
+		// Untrusted peer: headers are ignored.
+		{"203.0.113.50:1234", map[string][]string{"X-Forwarded-For": {"198.51.100.3"}}},
+		// Trusted peer without X-Forwarded-For: X-Real-Ip.
+		{"192.0.2.10:1234", map[string][]string{"X-Real-Ip": {"198.51.100.4"}}},
+	}
+
+	for _, r := range requests {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = r.remoteAddr
+
+		for key, values := range r.headers {
+			req.Header[key] = values
+		}
+
+		m.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	flushNow(m.writer)
+
+	want := "192.0.2.10 198.51.100.1\n192.0.2.10 198.51.100.2\n203.0.113.50 203.0.113.50\n192.0.2.10 198.51.100.4\n"
+	if got := readFile(t, file); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestQueueSizeChangeIsIgnored(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "access.log")
+	a := newTestMiddleware(t, &Config{File: file, QueueSize: 8}, nil)
+	b := newTestMiddleware(t, &Config{File: file, QueueSize: 32}, nil)
+
+	if a.writer != b.writer || cap(b.writer.entries) != 8 {
+		t.Errorf("queue size = %d, want the original 8 until restart", cap(b.writer.entries))
+	}
+}
+
 func TestServeHTTP_CustomFormat(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "access.log")
 	m := newTestMiddleware(t, &Config{File: file, Format: `{"{"}"method":"{.Method}","user":"{.User}","status":{.Status}{"}"}`}, nil)
@@ -240,7 +298,13 @@ func TestServeHTTP_AppendsToExistingFile(t *testing.T) {
 
 func TestServeHTTP_DoesNotBlockWhenQueueIsFull(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "access.log")
-	m := newTestMiddleware(t, &Config{File: file, Format: "{.Path}"}, nil)
+	const queueSize = 16
+
+	m := newTestMiddleware(t, &Config{File: file, Format: "{.Path}", QueueSize: queueSize}, nil)
+
+	if got := cap(m.writer.entries); got != queueSize {
+		t.Fatalf("queue size = %d, want %d", got, queueSize)
+	}
 
 	// Stall the writer goroutine.
 	release := make(chan struct{})

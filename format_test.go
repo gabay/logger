@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"text/template"
 	"time"
 )
 
@@ -11,7 +12,7 @@ import (
 func render(t *testing.T, layout string, e *entry) string {
 	t.Helper()
 
-	f, err := parseFormat(layout)
+	f, err := parseFormat(layout, nil)
 	if err != nil {
 		t.Fatalf("parseFormat(%q): %v", layout, err)
 	}
@@ -55,9 +56,9 @@ func TestDefault(t *testing.T) {
 }
 
 func TestAllFields(t *testing.T) {
-	layout := "{.Ip}|{.User}|{.Time}|{.Method}|{.Path}|{.Protocol}|{.Host}|{.Status}|" +
-		"{.ResponseSize}|{.HttpReferer}|{.HttpUserAgent}|{.Duration}"
-	want := "127.0.0.1|frank|10/Oct/2000:13:55:36 -0700|GET|/apache_pb.gif?a=1|HTTP/1.0|example.com|200|" +
+	layout := "{.Ip}|{.ClientIp}|{.User}|{.Time}|{.Method}|{.Path}|{.Protocol}|{.Host}|{.Status}|" +
+		"{.ResponseSize}|{.Referer}|{.UserAgent}|{.Duration}"
+	want := "127.0.0.1|127.0.0.1|frank|10/Oct/2000:13:55:36 -0700|GET|/apache_pb.gif?a=1|HTTP/1.0|example.com|200|" +
 		"2326|http://www.example.com/start.html|Mozilla/4.08|1500"
 
 	if got := render(t, layout, sampleEntry()); got != want {
@@ -68,8 +69,8 @@ func TestAllFields(t *testing.T) {
 func TestEmptyValues(t *testing.T) {
 	e := &entry{status: 404}
 
-	got := render(t, Default()+" {.Host} {.Protocol} {.Duration}", e)
-	want := `- - - [01/Jan/0001:00:00:00 +0000] "- -" 404 - "-" "-" - - 0`
+	got := render(t, Default()+" {.ClientIp} {.Host} {.Protocol} {.Duration}", e)
+	want := `- - - [01/Jan/0001:00:00:00 +0000] "- -" 404 - "-" "-" - - - 0`
 
 	if got != want {
 		t.Errorf("got  %s\nwant %s", got, want)
@@ -100,15 +101,18 @@ func TestTemplateFeatures(t *testing.T) {
 
 func TestParseFormat_Errors(t *testing.T) {
 	tests := map[string]string{
-		"{.Nope}":     "can't evaluate field Nope",
-		"{.ip}":       "can't evaluate field ip",
-		"x {.Ip":      "unclosed action",
-		"{if .Ip}":    "unexpected EOF",
-		"{nofunc .X}": `function "nofunc" not defined`,
+		"{.Nope}":                  "unknown field {.Nope}",
+		"{.ip}":                    "unknown field {.ip}",
+		"{.HttpUserAgent}":         "unknown field {.HttpUserAgent}",
+		"{if .Status}{.Nope}{end}": "unknown field {.Nope}", // branch not taken at validation
+		"{$f := .}{$f.Nope}":       "unknown field {.Nope}",
+		"x {.Ip":                   "unclosed action",
+		"{if .Ip}":                 "unexpected EOF",
+		"{nofunc .X}":              `function "nofunc" not defined`,
 	}
 
 	for layout, wantErr := range tests {
-		_, err := parseFormat(layout)
+		_, err := parseFormat(layout, nil)
 		if err == nil || !strings.Contains(err.Error(), wantErr) {
 			t.Errorf("parseFormat(%q): got error %v, want it to contain %q", layout, err, wantErr)
 		}
@@ -116,21 +120,49 @@ func TestParseFormat_Errors(t *testing.T) {
 }
 
 func TestDetectUsedFields(t *testing.T) {
+	all := usedFields{
+		ip: true, clientIP: true, user: true, time: true, method: true, path: true, protocol: true,
+		host: true, status: true, responseSize: true, referer: true, userAgent: true, duration: true,
+	}
+
 	tests := map[string]usedFields{
 		Default(): {
 			ip: true, user: true, time: true, method: true, path: true, status: true,
 			responseSize: true, referer: true, userAgent: true,
 		},
 		"no fields":                     {},
+		"literal .Host and .User text":  {},
 		"{.Ip} {.Status}":               {ip: true, status: true},
-		"{.HttpUserAgent}":              {userAgent: true},
-		"{with .}{.User}{end}":          {user: true},
+		"{.UserAgent}":                  {userAgent: true},
+		"{.ClientIp}":                   {clientIP: true},
 		"{.Host}{.Protocol}{.Duration}": {host: true, protocol: true, duration: true},
+		// Every branch counts.
+		`{if eq .Status "500"}{.Path}{else}{.Method}{end}`: {status: true, path: true, method: true},
+		"{with .Referer}{.}{end}":                          all, // conservative: a bare dot may be the Fields
+		// Through variables and pipelines.
+		"{$f := .Time}{$f}":            all,
+		"{$.User}":                     {user: true},
+		`{.UserAgent | printf "%.5s"}`: {userAgent: true},
+		// The whole Fields passed to a function.
+		`{printf "%v" .}`: all,
+		// Defined templates.
+		`{define "x"}{.Host}{end}{template "x" .}`: all,
 	}
 
 	for layout, want := range tests {
-		if got := detectUsedFields(layout); got != want {
-			t.Errorf("%s: got %+v, want %+v", layout, got, want)
+		tmpl, err := template.New("t").Delims(leftDelim, rightDelim).Parse(layout)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := detectUsedFields(tmpl)
+		if err != nil {
+			t.Errorf("%s: %v", layout, err)
+			continue
+		}
+
+		if got != want {
+			t.Errorf("%s:\ngot  %+v\nwant %+v", layout, got, want)
 		}
 	}
 }
@@ -173,7 +205,7 @@ func TestResponseSize(t *testing.T) {
 	}
 }
 
-func TestClientIP(t *testing.T) {
+func TestIpField(t *testing.T) {
 	tests := map[string]string{
 		"192.0.2.1:1234": "192.0.2.1",
 		"[::1]:80":       "::1",

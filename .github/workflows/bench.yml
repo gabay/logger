@@ -1,0 +1,78 @@
+name: Benchmarks
+
+# Compares the Yaegi benchmarks of a pull request against its base branch and
+# fails on a statistically significant regression (see
+# .github/scripts/benchcheck.py for the thresholds). Yaegi is what Traefik
+# runs the plugin with, so this is where performance matters.
+#
+# Shared runners are noisy: base and head are run alternately, several times,
+# so that drift affects both equally, and benchstat only reports significant
+# changes. Thresholds can be tuned through the env below.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+
+  bench:
+    name: Yaegi benchmark regressions
+    runs-on: ubuntu-latest
+    env:
+      GO_VERSION: '1.22'
+      YAEGI_VERSION: v0.16.1
+      CGO_ENABLED: 0
+      # Alternating runs per side; benchstat needs at least 6 for confidence intervals.
+      RUNS: 6
+      MAX_TIME_REGRESSION: 20
+      MAX_ALLOC_REGRESSION: 10
+
+    steps:
+
+      # https://github.com/marketplace/actions/setup-go-environment
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # https://github.com/marketplace/actions/checkout
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          path: head
+          fetch-depth: 0
+
+      - name: Check out base (${{ github.base_ref }})
+        working-directory: head
+        run: git worktree add ../base "origin/${{ github.base_ref }}"
+
+      - name: Install Yaegi ${{ env.YAEGI_VERSION }}
+        run: curl -sfL https://raw.githubusercontent.com/traefik/yaegi/master/install.sh | bash -s -- -b $(go env GOPATH)/bin ${YAEGI_VERSION}
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Run benchmarks
+        run: |
+          if ! grep -q '^yaegi_bench:' base/Makefile; then
+            echo "Base has no yaegi_bench target: nothing to compare against."
+            echo "SKIP_BENCH=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # stderr carries the plugin's own log lines, which would otherwise
+          # be interleaved with the benchmark results.
+          for i in $(seq "$RUNS"); do
+            echo "Run $i/$RUNS"
+            make -s -C base yaegi_bench 2>/dev/null >> base.txt
+            make -s -C head yaegi_bench 2>/dev/null >> head.txt
+          done
+
+      - name: Compare
+        if: env.SKIP_BENCH != '1'
+        run: |
+          benchstat base.txt head.txt | tee comparison.txt
+          { echo '```'; cat comparison.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          benchstat -format csv base.txt head.txt 2>/dev/null | python3 head/.github/scripts/benchcheck.py

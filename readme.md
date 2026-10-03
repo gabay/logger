@@ -38,7 +38,11 @@ http:
         logger:
           file: /var/log/traefik/access.log
           # Optional, defaults to the Common Log Format below.
-          format: '{.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.HttpReferer}" "{.HttpUserAgent}"'
+          format: '{.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.Referer}" "{.UserAgent}"'
+          # Optional: proxies whose X-Forwarded-For / X-Real-Ip are trusted for {.ClientIp}.
+          trustedForwarders: [10.0.0.0/8, 192.0.2.1]
+          # Optional: entries buffered per file before new ones are dropped.
+          queueSize: 8192
           # Optional: without a rotate section the file is never rotated.
           rotate:
             schedule: "0 0 * * *" # default: daily at midnight
@@ -50,6 +54,8 @@ http:
 |-------------------------|----------|--------------|-------------|
 | `file`                  | yes      |              | Log file path. Relative paths are resolved against Traefik's working directory. Missing directories are created. |
 | `format`                | no       | `Default()`  | Line format, see [Format](#format). |
+| `trustedForwarders`     | no       | none         | IP addresses and CIDR ranges of proxies in front of Traefik, used by `{.ClientIp}`. See [Client IP](#client-ip). |
+| `queueSize`             | no       | `8192`       | Entries buffered per file between requests and the writer, 1 to 1048576. When it is full, entries are dropped (and counted) instead of delaying responses. Set once per file: a different value from a reload is ignored (and reported) until Traefik restarts. |
 | `rotate`                | no       | disabled     | Enables rotation when present. Fields left unset use their defaults. |
 | `rotate.schedule`       | no       | `0 0 * * *`  | Cron expression: 5 fields, 7 fields (with seconds and year) or a descriptor (`@daily`, `@hourly`, `@weekly`, …). Uses the time zone of the Traefik process. |
 | `rotate.keep`           | no       | `1`          | Number of plain-text backups: `<file>.1` … `<file>.<keep>`. |
@@ -63,7 +69,8 @@ The format is a Go [`text/template`](https://pkg.go.dev/text/template) that uses
 
 | Field              | Value | Example |
 |--------------------|-------|---------|
-| `{.Ip}`            | Client IP: the connection's remote address without the port. This is the direct peer, so behind another proxy it's that proxy's IP. | `203.0.113.7` |
+| `{.Ip}`            | The connection's remote address without the port. This is the direct peer, so behind another proxy it's that proxy's IP. | `203.0.113.7` |
+| `{.ClientIp}`      | Originating client IP, read from `X-Forwarded-For` / `X-Real-Ip` when the peer is a trusted forwarder; otherwise the same as `{.Ip}`. See [Client IP](#client-ip). | `198.51.100.1` |
 | `{.User}`          | User name from HTTP basic authentication (`Authorization: Basic …`) | `frank` |
 | `{.Time}`          | Request start time, in Common Log Format, in the Traefik process's time zone | `10/Oct/2000:13:55:36 -0700` |
 | `{.Method}`        | Request method | `GET` |
@@ -72,8 +79,8 @@ The format is a Go [`text/template`](https://pkg.go.dev/text/template) that uses
 | `{.Host}`          | Request host (`Host` header) | `example.com` |
 | `{.Status}`        | Response status code | `200` |
 | `{.ResponseSize}`  | `Content-Length` response header (body size in bytes); `-` when absent, e.g. for chunked or streamed responses | `2326` |
-| `{.HttpReferer}`   | `Referer` request header | `https://example.com/` |
-| `{.HttpUserAgent}` | `User-Agent` request header | `curl/8.5.0` |
+| `{.Referer}`       | `Referer` request header | `https://example.com/` |
+| `{.UserAgent}`     | `User-Agent` request header | `curl/8.5.0` |
 | `{.Duration}`      | Time spent in the next handlers (upstream included), in milliseconds | `12` |
 
 Field names are case-sensitive. Every field is a string:
@@ -95,6 +102,25 @@ Since `{` starts an action, write a literal brace as a string constant: `{"{"}` 
 ```text
 {"{"}"ip":"{.Ip}","status":{.Status},"path":"{.Path}"{"}"}
 ```
+
+## Client IP
+
+`{.Ip}` is always the direct peer. `{.ClientIp}` resolves the originating client behind proxies:
+
+1. If `trustedForwarders` is empty, or the peer isn't in it, the peer is the client: headers sent by untrusted peers are ignored, so they can't be spoofed.
+2. Otherwise, `X-Forwarded-For` is read from right to left, skipping trusted forwarders. The first untrusted address is the client. Addresses further left were written by the client itself and are ignored. If every address is trusted, the leftmost one is used.
+3. Without `X-Forwarded-For`, `X-Real-Ip` is used. If that is missing too, the peer is used.
+
+> [!IMPORTANT]
+> Before middlewares run, Traefik's entrypoint drops the `X-Forwarded-*` and `X-Real-Ip` headers of peers not listed in [`entryPoints.<name>.forwardedHeaders.trustedIPs`](https://doc.traefik.io/traefik/routing/entrypoints/#forwarded-headers), then sets a missing `X-Real-Ip` to the peer address. Your proxies must be listed there **and** in `trustedForwarders`:
+>
+> ```yaml
+> entryPoints:
+>   web:
+>     address: ":80"
+>     forwardedHeaders:
+>       trustedIPs: ["10.0.0.0/8"]
+> ```
 
 ## Rotation and retention
 
@@ -121,9 +147,10 @@ Each conversion writes to a temporary file that is atomically renamed before the
 
 ## Design notes
 
-- **Request path**: the middleware captures only the values the format uses (strings are shared, not copied), wraps the response writer to record the status code, and does a non-blocking send to the writer's channel (8192 entries). `Write` is not wrapped: the size comes from `Content-Length`, so body writes add no interpreted calls.
+- **Request path**: the middleware captures only the values the format uses (strings are shared, not copied), wraps the response writer to record the status code, and does a non-blocking send to the writer's channel (`queueSize`, 8192 entries by default). `Write` is not wrapped: the size comes from `Content-Length`, so body writes add no interpreted calls.
 - **Writer**: a single goroutine per file builds the template data (only the fields used), executes the template into a reused buffer, and writes the result through a 64 KiB buffer. Escaping uses a `strings.Replacer`, and execution uses `text/template`, both from the standard library, which runs compiled inside Traefik while the plugin's own code is interpreted. A line whose template fails at runtime is skipped and reported, never written partially. It flushes whenever the queue is empty, so idle periods reach the disk immediately and bursts are batched. Dropped entries and write errors are reported on Traefik's error log.
-- **Sharing and reloads**: Traefik calls `New` for every router and on every configuration reload, and it never closes old instances. Writers are therefore kept in a global registry, one per absolute file path and protected by a global lock. Every middleware instance that logs to the same file shares that file's writer, so there are no duplicate file handles, goroutines or concurrent rotations. The most recently applied rotation settings win.
+- **Compression** runs in-process with the standard library's `compress/gzip`, which runs compiled (not interpreted) code: about 380 MB/s at the default level. Faster pure-Go implementations such as `klauspost/compress` can't be used, because they import `unsafe`, which Yaegi rejects.
+- **Sharing and reloads**: Traefik calls `New` for every router and on every configuration reload, and it never closes old instances. Writers are therefore kept in a global registry, one per absolute file path and protected by a global lock. Every middleware instance that logs to the same file shares that file's writer, so there are no duplicate file handles, goroutines or concurrent rotations. The most recently applied rotation settings win. The queue size is fixed when the writer is created.
 
 ### Performance
 
@@ -133,6 +160,7 @@ Plugin code is interpreted by Yaegi, so native benchmarks are misleading. Measur
 |---|---|---|
 | Added to each request (`ServeHTTP`) | ~3.9 µs | ~0.1 µs |
 | Writer: format and buffer one default-format line | ~25 µs (~40k lines/s per file) | ~3.5 µs |
+| Writer: `{.ClientIp}` resolution with trusted forwarders (`BenchmarkFormatClientIp`, compared with `BenchmarkFormat`) | ~+16 µs per line | |
 
 Entries beyond the writer's throughput are dropped (and reported) rather than slowing requests down.
 
@@ -151,6 +179,17 @@ make bench       # benchmarks
 make yaegi_test  # run the tests in the Yaegi interpreter, like Traefik does
 make yaegi_bench # run the benchmarks in Yaegi: these are the numbers that matter in Traefik
 make vendor      # vendor dependencies (required for Yaegi plugins; commit vendor/)
+```
+
+### Benchmark regressions
+
+The [Benchmarks](.github/workflows/bench.yml) workflow runs on every pull request. It runs `make yaegi_bench` 6 times on the base branch and 6 times on the pull request, alternating between them, and compares the results with [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat). It fails when a change is statistically significant and exceeds +20% in `sec/op` or +10% in `allocs/op` (see [benchcheck.py](.github/scripts/benchcheck.py)). Shared CI runners are noisy, so a borderline failure is worth re-running before investigating. To compare locally:
+
+```sh
+git worktree add /tmp/logger-base master
+make -s -C /tmp/logger-base yaegi_bench BENCH_FLAGS=-count=6 2>/dev/null > /tmp/base.txt
+make -s yaegi_bench BENCH_FLAGS=-count=6 2>/dev/null > /tmp/head.txt
+benchstat -format csv /tmp/base.txt /tmp/head.txt | .github/scripts/benchcheck.py
 ```
 
 ### Local mode

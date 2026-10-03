@@ -7,6 +7,9 @@ export GO111MODULE=on
 MODULE := github.com/gabay/logger
 YAEGI_GOPATH := $(CURDIR)/.yaegi
 
+# Extra flags for the benchmark targets, e.g. BENCH_FLAGS=-count=6.
+BENCH_FLAGS ?=
+
 default: lint test
 
 lint:
@@ -29,7 +32,7 @@ yaegi_test: yaegi
 	cd $(YAEGI_GOPATH)/src/$(MODULE) && GOPATH=$(YAEGI_GOPATH) yaegi test -v $(MODULE)
 
 yaegi_bench: yaegi
-	cd $(YAEGI_GOPATH)/src/$(MODULE) && GOPATH=$(YAEGI_GOPATH) yaegi test -run '^$$' -bench . -benchmem $(MODULE)
+	cd $(YAEGI_GOPATH)/src/$(MODULE) && GOPATH=$(YAEGI_GOPATH) yaegi test -run '^$$' -bench . -benchmem $(BENCH_FLAGS) $(MODULE)
 
 vendor:
 	go mod vendor

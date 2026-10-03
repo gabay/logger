@@ -13,10 +13,6 @@ import (
 )
 
 const (
-	// queueSize is the number of entries buffered between request goroutines
-	// and a writer. When full, new entries are dropped rather than blocking
-	// responses.
-	queueSize = 8192
 	// bufferSize is the size of the in-memory write buffer of a log file.
 	bufferSize = 64 << 10
 
@@ -37,13 +33,19 @@ var registry = struct { //nolint:gochecknoglobals // plugins have no lifecycle h
 	writers map[string]*fileWriter
 }{writers: make(map[string]*fileWriter)}
 
-// acquireWriter returns the writer for path, creating it if needed, and
-// applies the rotation settings rot (nil disables rotation).
-func acquireWriter(path string, rot *rotation) (*fileWriter, error) {
+// acquireWriter returns the writer for path, creating it with a queue of
+// queueSize entries if needed, and applies the rotation settings rot (nil
+// disables rotation). The queue of an existing writer cannot be resized: a
+// different queueSize is reported and ignored until Traefik restarts.
+func acquireWriter(path string, rot *rotation, queueSize int) (*fileWriter, error) {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 
 	if w, ok := registry.writers[path]; ok {
+		if size := cap(w.entries); size != queueSize {
+			logInfo(fmt.Sprintf("queue size of %s changed from %d to %d: restart Traefik to apply it", path, size, queueSize))
+		}
+
 		if !w.rot.equal(rot) {
 			logInfo(fmt.Sprintf("rotation settings of %s changed to %s, applying them", path, rot.String()))
 			w.configure(rot)
@@ -52,7 +54,7 @@ func acquireWriter(path string, rot *rotation) (*fileWriter, error) {
 		return w, nil
 	}
 
-	w, err := newFileWriter(path, rot)
+	w, err := newFileWriter(path, rot, queueSize)
 	if err != nil {
 		return nil, err
 	}
@@ -104,8 +106,8 @@ type fileWriter struct {
 }
 
 // newFileWriter opens path, cleans up existing backups according to rot and
-// starts the writer goroutine.
-func newFileWriter(path string, rot *rotation) (*fileWriter, error) {
+// starts the writer goroutine, consuming a queue of queueSize entries.
+func newFileWriter(path string, rot *rotation, queueSize int) (*fileWriter, error) {
 	if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
 		return nil, fmt.Errorf("creating log directory: %w", err)
 	}

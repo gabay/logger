@@ -87,14 +87,14 @@ func BenchmarkNextOnly(b *testing.B) {
 // BenchmarkWriterThroughput measures the writer goroutine side: formatting
 // and buffered writing of one entry to a real file.
 func BenchmarkWriterThroughput(b *testing.B) {
-	w, err := newFileWriter(filepath.Join(b.TempDir(), "access.log"), nil)
+	w, err := newFileWriter(filepath.Join(b.TempDir(), "access.log"), nil, DefaultQueueSize)
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	defer releaseWriter(b, w)
 
-	f, err := parseFormat(Default())
+	f, err := parseFormat(Default(), nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -118,12 +118,43 @@ func BenchmarkWriterThroughput(b *testing.B) {
 // BenchmarkFormat measures formatting a default-format line: building the
 // escaped Fields and executing the template.
 func BenchmarkFormat(b *testing.B) {
-	f, err := parseFormat(Default())
+	f, err := parseFormat(Default(), nil)
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	e := benchEntry(f)
+
+	var buf bytes.Buffer
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+
+		if err := f.execute(&buf, e); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkFormatClientIp measures {.ClientIp} resolution through two
+// trusted forwarders.
+func BenchmarkFormatClientIp(b *testing.B) {
+	trusted, err := parseTrustedForwarders([]string{"10.0.0.0/8", "192.0.2.0/24"})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	f, err := parseFormat("{.ClientIp}", trusted)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	e := benchEntry(f)
+	e.remoteAddr = "192.0.2.10:1234"
+	e.forwardedFor = "198.51.100.1, 10.0.0.5"
 
 	var buf bytes.Buffer
 

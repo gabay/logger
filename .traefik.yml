@@ -11,8 +11,15 @@ testData:
   # absolute path such as /var/log/traefik/access.log in production.
   file: access.log
   # When no format is given, the Common Log Format is used:
-  # {.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.HttpReferer}" "{.HttpUserAgent}"
-  format: '{.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.HttpReferer}" "{.HttpUserAgent}"'
+  # {.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.Referer}" "{.UserAgent}"
+  format: '{.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.Referer}" "{.UserAgent}"'
+  # Proxies whose X-Forwarded-For / X-Real-Ip headers are trusted for
+  # {.ClientIp} (optional; also list them in the entrypoint's
+  # forwardedHeaders.trustedIPs).
+  trustedForwarders:
+    - 10.0.0.0/8
+  # Entries buffered per file before new ones are dropped (optional).
+  queueSize: 8192
   # Rotation is optional; when present it defaults to daily at midnight,
   # keeping 1 plain-text file and 0 compressed files.
   rotate:

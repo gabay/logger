@@ -33,6 +33,15 @@ const (
 	DefaultKeepCompressed = 0
 )
 
+// Queue size bounds.
+const (
+	// DefaultQueueSize is the number of entries buffered per file by default.
+	DefaultQueueSize = 8192
+	// MaxQueueSize caps the queue size: each queued entry holds a few hundred
+	// bytes, so this bounds the memory to a few hundred megabytes per file.
+	MaxQueueSize = 1 << 20
+)
+
 // Config is the plugin configuration, decoded by Traefik from the dynamic configuration.
 type Config struct {
 	// File is the path of the access log. Relative paths are resolved against
@@ -43,6 +52,16 @@ type Config struct {
 	Format string `json:"format,omitempty"`
 	// Rotate enables scheduled rotation. When nil, the file is never rotated.
 	Rotate *RotateConfig `json:"rotate,omitempty"`
+	// TrustedForwarders lists the IP addresses and CIDR ranges (e.g.
+	// "10.0.0.0/8") of proxies whose X-Forwarded-For and X-Real-Ip headers
+	// are trusted to compute {.ClientIp}. Empty means none: {.ClientIp} is
+	// then the direct peer, like {.Ip}.
+	TrustedForwarders []string `json:"trustedForwarders,omitempty"`
+	// QueueSize is the number of entries buffered between requests and the
+	// file writer; entries are dropped when it is full. Zero means
+	// [DefaultQueueSize]; at most [MaxQueueSize]. The queue is created with
+	// the writer of a file, so changing it takes effect on Traefik restart.
+	QueueSize int `json:"queueSize,omitempty"`
 }
 
 // RotateConfig configures scheduled log rotation.
@@ -99,9 +118,19 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		layout = Default()
 	}
 
-	compiled, err := parseFormat(layout)
+	trusted, err := parseTrustedForwarders(config.TrustedForwarders)
 	if err != nil {
 		return nil, fmt.Errorf("logger: %w", err)
+	}
+
+	compiled, err := parseFormat(layout, trusted)
+	if err != nil {
+		return nil, fmt.Errorf("logger: %w", err)
+	}
+
+	queueSize, err := resolveQueueSize(config.QueueSize)
+	if err != nil {
+		return nil, err
 	}
 
 	var rot *rotation
@@ -112,12 +141,26 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		}
 	}
 
-	writer, err := acquireWriter(path, rot)
+	writer, err := acquireWriter(path, rot, queueSize)
 	if err != nil {
 		return nil, fmt.Errorf("logger: %w", err)
 	}
 
 	return &Middleware{next: next, name: name, format: compiled, writer: writer}, nil
+}
+
+// resolveQueueSize applies the default to an unset (zero) queue size and
+// validates it.
+func resolveQueueSize(size int) (int, error) {
+	if size == 0 {
+		return DefaultQueueSize, nil
+	}
+
+	if size < 0 || size > MaxQueueSize {
+		return 0, fmt.Errorf("logger: queueSize %d must be between 1 and %d", size, MaxQueueSize)
+	}
+
+	return size, nil
 }
 
 // ServeHTTP calls the next handler and enqueues an access log entry for it.
@@ -155,6 +198,11 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		e.authorization = headerValue(req.Header, "Authorization")
 	}
 
+	if used.clientIP && len(m.format.trusted) > 0 {
+		e.forwardedFor = joinedHeader(req.Header, "X-Forwarded-For")
+		e.realIP = headerValue(req.Header, "X-Real-Ip")
+	}
+
 	rec := &responseRecorder{ResponseWriter: rw}
 	m.next.ServeHTTP(rec, req)
 
@@ -176,4 +224,18 @@ func headerValue(h http.Header, canonicalKey string) string {
 	}
 
 	return ""
+}
+
+// joinedHeader returns all the values of a header whose key is in canonical
+// form, joined with commas: a list header may be split across several lines.
+//
+// Note: this deliberately avoids a "switch v := ...; len(v)" statement, which
+// Yaegi evaluates incorrectly.
+func joinedHeader(h http.Header, canonicalKey string) string {
+	values := h[canonicalKey]
+	if len(values) == 1 {
+		return values[0]
+	}
+
+	return strings.Join(values, ",") // "" for no values.
 }
