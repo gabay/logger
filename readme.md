@@ -1,270 +1,165 @@
-This repository includes an example plugin, `demo`, for you to use as a reference for developing your own plugins.
+# Logger — Traefik access log plugin
 
-[![Build Status](https://github.com/traefik/plugindemo/workflows/Main/badge.svg?branch=master)](https://github.com/traefik/plugindemo/actions)
+[![Build Status](https://github.com/gabay/logger/workflows/Main/badge.svg?branch=master)](https://github.com/gabay/logger/actions)
 
-The existing plugins can be browsed into the [Plugin Catalog](https://plugins.traefik.io).
+A [Traefik](https://traefik.io) middleware plugin (run by the [Yaegi](https://github.com/traefik/yaegi) interpreter) that writes access logs to a file, with a configurable line format and optional scheduled rotation with gzip compression.
 
-# Developing a Traefik plugin
+- **Configurable format**: a Go template with `{` / `}` delimiters, e.g. `{.Ip} {.Status}`. The default is the Common Log Format (with referer and user agent).
+- **Never blocks requests**: entries go through a buffered channel to one background writer per file. The writer formats, buffers and writes them. If it can't keep up, entries are dropped and counted rather than delaying responses.
+- **Scheduled rotation** with a cron expression, keeping `keep` plain-text backups followed by `keepCompressed` gzip backups.
+- **Self-healing retention**: on startup and whenever the retention changes, existing backups are converted (compressed or decompressed) and pruned to match the configuration.
 
-[Traefik](https://traefik.io) plugins are developed using the [Go language](https://golang.org).
+## Configuration
 
-A [Traefik](https://traefik.io) middleware plugin is just a [Go package](https://golang.org/ref/spec#Packages) that provides an `http.Handler` to perform specific processing of requests and responses.
-
-Rather than being pre-compiled and linked, however, plugins are executed on the fly by [Yaegi](https://github.com/traefik/yaegi), an embedded Go interpreter.
-
-## Usage
-
-For a plugin to be active for a given Traefik instance, it must be declared in the static configuration.
-
-Plugins are parsed and loaded exclusively during startup, which allows Traefik to check the integrity of the code and catch errors early on.
-If an error occurs during loading, the plugin is disabled.
-
-For security reasons, it is not possible to start a new plugin or modify an existing one while Traefik is running.
-
-Once loaded, middleware plugins behave exactly like statically compiled middlewares.
-Their instantiation and behavior are driven by the dynamic configuration.
-
-Plugin dependencies must be [vendored](https://golang.org/ref/mod#vendoring) for each plugin.
-Vendored packages should be included in the plugin's GitHub repository. ([Go modules](https://blog.golang.org/using-go-modules) are not supported.)
-
-### Configuration
-
-For each plugin, the Traefik static configuration must define the module name (as is usual for Go packages).
-
-The following declaration (given here in YAML) defines a plugin:
+### Static configuration
 
 ```yaml
-# Static configuration
-
 experimental:
   plugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
-      version: v0.2.1
+    logger:
+      moduleName: github.com/gabay/logger
+      version: v0.1.0
 ```
 
-Here is an example of a file provider dynamic configuration (given here in YAML), where the interesting part is the `http.middlewares` section:
+### Dynamic configuration
 
 ```yaml
-# Dynamic configuration
-
 http:
   routers:
     my-router:
       rule: host(`demo.localhost`)
       service: service-foo
-      entryPoints:
-        - web
-      middlewares:
-        - my-plugin
+      entryPoints: [web]
+      middlewares: [access-log]
 
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
   middlewares:
-    my-plugin:
+    access-log:
       plugin:
-        example:
-          headers:
-            Foo: Bar
+        logger:
+          file: /var/log/traefik/access.log
+          # Optional, defaults to the Common Log Format below.
+          format: '{.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.HttpReferer}" "{.HttpUserAgent}"'
+          # Optional: without a rotate section the file is never rotated.
+          rotate:
+            schedule: "0 0 * * *" # default: daily at midnight
+            keep: 2               # default: 1  -> access.log.1, access.log.2
+            keepCompressed: 2     # default: 0  -> access.log.3.gz, access.log.4.gz
 ```
 
-### Local Mode
+| Option                  | Required | Default      | Description |
+|-------------------------|----------|--------------|-------------|
+| `file`                  | yes      |              | Log file path. Relative paths are resolved against Traefik's working directory. Missing directories are created. |
+| `format`                | no       | `Default()`  | Line format, see [Format](#format). |
+| `rotate`                | no       | disabled     | Enables rotation when present. Fields left unset use their defaults. |
+| `rotate.schedule`       | no       | `0 0 * * *`  | Cron expression: 5 fields, 7 fields (with seconds and year) or a descriptor (`@daily`, `@hourly`, `@weekly`, …). Uses the time zone of the Traefik process. |
+| `rotate.keep`           | no       | `1`          | Number of plain-text backups: `<file>.1` … `<file>.<keep>`. |
+| `rotate.keepCompressed` | no       | `0`          | Number of gzip backups kept after the plain ones: `<file>.<keep+1>.gz` … |
 
-Traefik also offers a developer mode that can be used for temporary testing of plugins not hosted on GitHub.
-To use a plugin in local mode, the Traefik static configuration must define the module name (as is usual for Go packages) and a path to a [Go workspace](https://golang.org/doc/gopath_code.html#Workspaces), which can be the local GOPATH or any directory.
+### Format
 
-The plugins must be placed in `./plugins-local` directory,
-which should be in the working directory of the process running the Traefik binary.
-The source code of the plugin should be organized as follows:
+The format is a Go [`text/template`](https://pkg.go.dev/text/template) that uses `{` and `}` as delimiters instead of `{{` and `}}`. It is executed once per request with the fields below. The format is validated when the configuration loads: a syntax error or an unknown field (such as `{.Nope}`) makes Traefik reject the middleware.
 
+#### Supported fields
+
+| Field              | Value | Example |
+|--------------------|-------|---------|
+| `{.Ip}`            | Client IP: the connection's remote address without the port. This is the direct peer, so behind another proxy it's that proxy's IP. | `203.0.113.7` |
+| `{.User}`          | User name from HTTP basic authentication (`Authorization: Basic …`) | `frank` |
+| `{.Time}`          | Request start time, in Common Log Format, in the Traefik process's time zone | `10/Oct/2000:13:55:36 -0700` |
+| `{.Method}`        | Request method | `GET` |
+| `{.Path}`          | Request URI as received, including the query string | `/items?page=2` |
+| `{.Protocol}`      | Request protocol | `HTTP/1.1` |
+| `{.Host}`          | Request host (`Host` header) | `example.com` |
+| `{.Status}`        | Response status code | `200` |
+| `{.ResponseSize}`  | `Content-Length` response header (body size in bytes); `-` when absent, e.g. for chunked or streamed responses | `2326` |
+| `{.HttpReferer}`   | `Referer` request header | `https://example.com/` |
+| `{.HttpUserAgent}` | `User-Agent` request header | `curl/8.5.0` |
+| `{.Duration}`      | Time spent in the next handlers (upstream included), in milliseconds | `12` |
+
+Field names are case-sensitive. Every field is a string:
+
+- **Empty values** are written as `-`.
+- **Escaping:** quotes, backslashes and control characters are escaped JSON-style (`\"`, `\\`, `\n`, `\u0001`), so a request value can't break out of a quoted field or inject fake log lines.
+
+#### Template features
+
+Any template action works, for example:
+
+```text
+{.Method} {.Path} {.Status}{if ne .Status "200"} !{end}
+{printf "%-7s" .Method} {.Path}
 ```
-./plugins-local/
-    └── src
-        └── github.com
-            └── traefik
-                └── plugindemo
-                    ├── demo.go
-                    ├── demo_test.go
-                    ├── go.mod
-                    ├── LICENSE
-                    ├── Makefile
-                    └── readme.md
+
+Since `{` starts an action, write a literal brace as a string constant: `{"{"}` and `{"}"}`. For example, JSON lines:
+
+```text
+{"{"}"ip":"{.Ip}","status":{.Status},"path":"{.Path}"{"}"}
 ```
+
+## Rotation and retention
+
+When the schedule fires, the writer goroutine flushes the file, shifts the backups (`.1` → `.2`, …), renames the file to `<file>.1` and reopens a fresh file. Because this happens on the same goroutine that writes the log, there is no race between writing and rotating. Compressing and pruning the backups then runs in the background, so logging resumes right away. Empty files are not rotated.
+
+With `keep: 2, keepCompressed: 2`, after a few rotations you get:
+
+```text
+access.log         current
+access.log.1       previous period
+access.log.2
+access.log.3.gz
+access.log.4.gz    oldest; anything older is deleted
+```
+
+You can change `keep` and `keepCompressed` between runs. On startup, or when a configuration reload changes them, the existing backups are fixed up to match:
+
+- indexes `1..keep` are decompressed if needed
+- indexes `keep+1..keep+keepCompressed` are compressed if needed
+- higher indexes are deleted
+- temporary files left by an interrupted conversion are removed
+
+Each conversion writes to a temporary file that is atomically renamed before the source is deleted, so a crash can never lose a backup. Without a `rotate` section, existing backups are left untouched.
+
+## Design notes
+
+- **Request path**: the middleware captures only the values the format uses (strings are shared, not copied), wraps the response writer to record the status code, and does a non-blocking send to the writer's channel (8192 entries). `Write` is not wrapped: the size comes from `Content-Length`, so body writes add no interpreted calls.
+- **Writer**: a single goroutine per file builds the template data (only the fields used), executes the template into a reused buffer, and writes the result through a 64 KiB buffer. Escaping uses a `strings.Replacer`, and execution uses `text/template`, both from the standard library, which runs compiled inside Traefik while the plugin's own code is interpreted. A line whose template fails at runtime is skipped and reported, never written partially. It flushes whenever the queue is empty, so idle periods reach the disk immediately and bursts are batched. Dropped entries and write errors are reported on Traefik's error log.
+- **Sharing and reloads**: Traefik calls `New` for every router and on every configuration reload, and it never closes old instances. Writers are therefore kept in a global registry, one per absolute file path and protected by a global lock. Every middleware instance that logs to the same file shares that file's writer, so there are no duplicate file handles, goroutines or concurrent rotations. The most recently applied rotation settings win.
+
+### Performance
+
+Plugin code is interpreted by Yaegi, so native benchmarks are misleading. Measured with `make yaegi_bench` (48-core Xeon, 2.6 GHz):
+
+| | Under Yaegi | Native |
+|---|---|---|
+| Added to each request (`ServeHTTP`) | ~3.9 µs | ~0.1 µs |
+| Writer: format and buffer one default-format line | ~25 µs (~40k lines/s per file) | ~3.5 µs |
+
+Entries beyond the writer's throughput are dropped (and reported) rather than slowing requests down.
+
+### Known limitations
+
+- **Streaming responses aren't flushed early.** When Yaegi hands an interpreted `http.ResponseWriter` wrapper to Traefik, it only exposes `http.Hijacker`; `http.Flusher` and `Unwrap` are lost. WebSockets work, but streamed responses (such as SSE) are delivered when Traefik's response buffer fills or the response completes. This affects every Yaegi plugin that wraps the response writer.
+- **Queued entries can be lost on shutdown.** Traefik gives plugins no shutdown hook. Entries still queued at shutdown may be lost, although the writer flushes as soon as its queue is empty.
+- **Old writers stay open.** If a reload changes `file`, the writer for the old path stays open (but idle) until Traefik restarts.
+
+## Development
+
+```sh
+make lint        # golangci-lint
+make test        # unit tests with the race detector and coverage
+make bench       # benchmarks
+make yaegi_test  # run the tests in the Yaegi interpreter, like Traefik does
+make yaegi_bench # run the benchmarks in Yaegi: these are the numbers that matter in Traefik
+make vendor      # vendor dependencies (required for Yaegi plugins; commit vendor/)
+```
+
+### Local mode
+
+To try the plugin without publishing it, copy the repository to `./plugins-local/src/github.com/gabay/logger` (relative to Traefik's working directory, with `vendor/` included) and declare it in the static configuration:
 
 ```yaml
-# Static configuration
-
 experimental:
   localPlugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
+    logger:
+      moduleName: github.com/gabay/logger
 ```
-
-(In the above example, the `plugindemo` plugin will be loaded from the path `./plugins-local/src/github.com/traefik/plugindemo`.)
-
-```yaml
-# Dynamic configuration
-
-http:
-  routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
-      middlewares:
-        - my-plugin
-
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
-  middlewares:
-    my-plugin:
-      plugin:
-        example:
-          headers:
-            Foo: Bar
-```
-
-## Defining a Plugin
-
-A plugin package must define the following exported Go objects:
-
-- A type `type Config struct { ... }`. The struct fields are arbitrary.
-- A function `func CreateConfig() *Config`.
-- A function `func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error)`.
-
-```go
-// Package example a example plugin.
-package example
-
-import (
-	"context"
-	"net/http"
-)
-
-// Config the plugin configuration.
-type Config struct {
-	// ...
-}
-
-// CreateConfig creates the default plugin configuration.
-func CreateConfig() *Config {
-	return &Config{
-		// ...
-	}
-}
-
-// Example a plugin.
-type Example struct {
-	next     http.Handler
-	name     string
-	// ...
-}
-
-// New created a new plugin.
-func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// ...
-	return &Example{
-		// ...
-	}, nil
-}
-
-func (e *Example) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// ...
-	e.next.ServeHTTP(rw, req)
-}
-```
-
-## Logs
-
-Currently, the only way to send logs to Traefik is to use `os.Stdout.WriteString("...")` or `os.Stderr.WriteString("...")`.
-
-In the future, we will try to provide something better and based on levels.
-
-## Plugins Catalog
-
-Traefik plugins are stored and hosted as public GitHub repositories.
-
-Once a day, the Plugins Catalog online service polls Github to find plugins and add them to its catalog.
-
-### Prerequisites
-
-To be recognized by Plugins Catalog, your repository must meet the following criteria:
-
-- The `traefik-plugin` topic must be set.
-- The `.traefik.yml` manifest must exist, and be filled with valid contents.
-
-If your repository fails to meet either of these prerequisites, Plugins Catalog will not see it.
-
-### Manifest
-
-A manifest is also mandatory, and it should be named `.traefik.yml` and stored at the root of your project.
-
-This YAML file provides Plugins Catalog with information about your plugin, such as a description, a full name, and so on.
-
-Here is an example of a typical `.traefik.yml`file:
-
-```yaml
-# The name of your plugin as displayed in the Plugins Catalog web UI.
-displayName: Name of your plugin
-
-# For now, `middleware` is the only type available.
-type: middleware
-
-# The import path of your plugin.
-import: github.com/username/my-plugin
-
-# A brief description of what your plugin is doing.
-summary: Description of what my plugin is doing
-
-# Medias associated to the plugin (optional)
-iconPath: foo/icon.png
-bannerPath: foo/banner.png
-
-# Configuration data for your plugin.
-# This is mandatory,
-# and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-testData:
-  Headers:
-    Foo: Bar
-```
-
-Properties include:
-
-- `displayName` (required): The name of your plugin as displayed in the Plugins Catalog web UI.
-- `type` (required): For now, `middleware` is the only type available.
-- `import` (required): The import path of your plugin.
-- `summary` (required): A brief description of what your plugin is doing.
-- `testData` (required): Configuration data for your plugin. This is mandatory, and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-- `iconPath` (optional): A local path in the repository to the icon of the project.
-- `bannerPath` (optional): A local path in the repository to the image that will be used when you will share your plugin page in social medias.
-
-There should also be a `go.mod` file at the root of your project. Plugins Catalog will use this file to validate the name of the project.
-
-### Tags and Dependencies
-
-Plugins Catalog gets your sources from a Go module proxy, so your plugins need to be versioned with a git tag.
-
-Last but not least, if your plugin middleware has Go package dependencies, you need to vendor them and add them to your GitHub repository.
-
-If something goes wrong with the integration of your plugin, Plugins Catalog will create an issue inside your Github repository and will stop trying to add your repo until you close the issue.
-
-## Troubleshooting
-
-If Plugins Catalog fails to recognize your plugin, you will need to make one or more changes to your GitHub repository.
-
-In order for your plugin to be successfully imported by Plugins Catalog, consult this checklist:
-
-- The `traefik-plugin` topic must be set on your repository.
-- There must be a `.traefik.yml` file at the root of your project describing your plugin, and it must have a valid `testData` property for testing purposes.
-- There must be a valid `go.mod` file at the root of your project.
-- Your plugin must be versioned with a git tag.
-- If you have package dependencies, they must be vendored and added to your GitHub repository.

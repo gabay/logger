@@ -1,12 +1,23 @@
-displayName: Demo Plugin
+displayName: Logger
 type: middleware
 iconPath: .assets/icon.png
 
-import: github.com/traefik/plugindemo
+import: github.com/gabay/logger
 
-summary: '[Demo] Add Request Header'
+summary: 'Writes access logs to a file with a configurable format and scheduled, compressed rotation'
 
 testData:
-  Headers:
-    X-Demo: test
-    X-URL: '{{URL}}'
+  # Relative paths are resolved against Traefik's working directory; use an
+  # absolute path such as /var/log/traefik/access.log in production.
+  file: access.log
+  # When no format is given, the Common Log Format is used:
+  # {.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.HttpReferer}" "{.HttpUserAgent}"
+  format: '{.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.HttpReferer}" "{.HttpUserAgent}"'
+  # Rotation is optional; when present it defaults to daily at midnight,
+  # keeping 1 plain-text file and 0 compressed files.
+  rotate:
+    schedule: "0 0 * * *"
+    # keep access.log.1 and access.log.2
+    keep: 2
+    # also keep access.log.3.gz and access.log.4.gz
+    keepCompressed: 2

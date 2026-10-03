@@ -1,75 +1,88 @@
+version: "2"
+
 run:
   timeout: 3m
-  skip-files: []
-  skip-dirs: []
-
-linters-settings:
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-  golint:
-    min-confidence: 0
-  gocyclo:
-    min-complexity: 12
-  goconst:
-    min-len: 5
-    min-occurrences: 4
-  misspell:
-    locale: US
-  funlen:
-    lines: -1
-    statements: 50
-  godox:
-    keywords:
-      - FIXME
-  gofumpt:
-    extra-rules: true
 
 linters:
-  enable-all: true
+  default: all
   disable:
-    - deadcode # deprecated
-    - exhaustivestruct # deprecated
-    - golint # deprecated
-    - ifshort # deprecated
-    - interfacer # deprecated
-    - maligned # deprecated
-    - nosnakecase # deprecated
-    - scopelint # deprecated
-    - scopelint # deprecated
-    - structcheck # deprecated
-    - varcheck # deprecated
-    - sqlclosecheck # not relevant (SQL)
-    - rowserrcheck # not relevant (SQL)
-    - execinquery # not relevant (SQL)
     - cyclop # duplicate of gocyclo
-    - bodyclose # Too many false positives: https://github.com/timakin/bodyclose/issues/30
+    - bodyclose # too many false positives: https://github.com/timakin/bodyclose/issues/30
+    - depguard # no import restrictions in this project
     - dupl
-    - testpackage
-    - tparallel
-    - paralleltest
-    - nlreturn
-    - wsl
+    - err113
     - exhaustive
     - exhaustruct
-    - goerr113
-    - wrapcheck
-    - ifshort
-    - noctx
-    - lll
-    - gomnd
+    - exhaustruct_v5
     - forbidigo
+    - intrange # range-over-int is not reliably supported by Yaegi
+    - lll
+    - mnd
+    - nlreturn
+    - noctx
+    - paralleltest
+    - rowserrcheck # not relevant (SQL)
+    - sqlclosecheck # not relevant (SQL)
+    - testpackage # tests exercise unexported internals (writer, rotation)
+    - tparallel
     - varnamelen
+    - wrapcheck
+    - wsl
+    - wsl_v5
+    - noinlineerr # `if err := f(); err != nil` is idiomatic
+    - gomodguard # deprecated
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    gocyclo:
+      min-complexity: 12
+    goconst:
+      min-len: 5
+      min-occurrences: 4
+    misspell:
+      locale: US
+    funlen:
+      lines: -1
+      statements: 50
+    gosec:
+      excludes:
+        - G304 # file paths come from the operator's configuration by design
+    modernize:
+      disable:
+        - rangeint # range-over-int is not reliably supported by Yaegi
+    godox:
+      keywords:
+        - FIXME
+  exclusions:
+    paths:
+      - vendor
+    rules:
+      - path: (.+)_test.go
+        linters:
+          - goconst
+          - funlen
+          - godot
+          - forcetypeassert
+          - gosec
+          - gocyclo
+          - gochecknoglobals
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      extra:
+        group-params: true
+  exclusions:
+    paths:
+      - vendor
 
 issues:
-  exclude-use-default: false
-  max-per-linter: 0
+  max-issues-per-linter: 0
   max-same-issues: 0
-  exclude: []
-  exclude-rules:
-    - path: (.+)_test.go
-      linters:
-        - goconst
-        - funlen
-        - godot
