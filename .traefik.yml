@@ -4,23 +4,19 @@ iconPath: .assets/icon.png
 
 import: github.com/gabay/logger
 
-summary: 'Writes access logs to a file with a configurable format and scheduled, compressed rotation'
+summary: 'Access logs with configurable format, rotation schedule and compression'
 
 testData:
-  # Relative paths are resolved against Traefik's working directory; use an
-  # absolute path such as /var/log/traefik/access.log in production.
+  # Relative paths are resolved against Traefik's working directory
   file: access.log
-  # When no format is given, the Common Log Format is used:
-  # {.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.Referer}" "{.UserAgent}"
+  # (optional) Log format. Defaults to Common Log Format.
   format: '{.Ip} - {.User} [{.Time}] "{.Method} {.Path}" {.Status} {.ResponseSize} "{.Referer}" "{.UserAgent}"'
-  # Proxies whose X-Forwarded-For / X-Real-Ip headers are trusted for
-  # {.ClientIp} (optional; also list them in the entrypoint's
-  # forwardedHeaders.trustedIPs).
+  # (optional) Proxies whose X-Forwarded-For / X-Real-Ip headers are trusted for {.ClientIp}.
   trustedForwarders:
     - 10.0.0.0/8
-  # Entries buffered per file before new ones are dropped (optional).
+  # (optional) Entries buffered per file before new ones are dropped.
   queueSize: 8192
-  # Rotation is optional; when present it defaults to daily at midnight,
+  # (optional) Rotation configuration; when present it defaults to daily at midnight,
   # keeping 1 plain-text file and 0 compressed files.
   rotate:
     schedule: "0 0 * * *"

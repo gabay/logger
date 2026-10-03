@@ -1,6 +1,6 @@
 # Logger — Traefik access log plugin
 
-[![Build Status](https://github.com/gabay/logger/workflows/Main/badge.svg?branch=master)](https://github.com/gabay/logger/actions)
+[![Build Status](https://github.com/gabay/logger/workflows/Main/badge.svg)](https://github.com/gabay/logger/actions)
 
 A [Traefik](https://traefik.io) middleware plugin (run by the [Yaegi](https://github.com/traefik/yaegi) interpreter) that writes access logs to a file, with a configurable line format and optional scheduled rotation with gzip compression.
 
@@ -186,7 +186,7 @@ make vendor      # vendor dependencies (required for Yaegi plugins; commit vendo
 The [Benchmarks](.github/workflows/bench.yml) workflow runs on every pull request. It runs `make yaegi_bench` 6 times on the base branch and 6 times on the pull request, alternating between them, and compares the results with [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat). It fails when a change is statistically significant and exceeds +20% in `sec/op` or +10% in `allocs/op` (see [benchcheck.py](.github/scripts/benchcheck.py)). Shared CI runners are noisy, so a borderline failure is worth re-running before investigating. To compare locally:
 
 ```sh
-git worktree add /tmp/logger-base master
+git worktree add /tmp/logger-base main
 make -s -C /tmp/logger-base yaegi_bench BENCH_FLAGS=-count=6 2>/dev/null > /tmp/base.txt
 make -s yaegi_bench BENCH_FLAGS=-count=6 2>/dev/null > /tmp/head.txt
 benchstat -format csv /tmp/base.txt /tmp/head.txt | .github/scripts/benchcheck.py

@@ -3,7 +3,7 @@ name: Main
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
       GO_VERSION: '1.22'
       GOLANGCI_LINT_VERSION: v2.14.0
       YAEGI_VERSION: v0.16.1
-      CGO_ENABLED: 0
+      CGO_ENABLED: 1
     defaults:
       run:
         working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}
@@ -46,7 +46,7 @@ jobs:
 
       # https://golangci-lint.run/usage/install#other-ci
       - name: Install golangci-lint ${{ env.GOLANGCI_LINT_VERSION }}
-        run: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin ${GOLANGCI_LINT_VERSION}
+        run: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/main/install.sh | sh -s -- -b $(go env GOPATH)/bin ${GOLANGCI_LINT_VERSION}
 
       - name: Install Yaegi ${{ env.YAEGI_VERSION }}
         run: curl -sfL https://raw.githubusercontent.com/traefik/yaegi/master/install.sh | bash -s -- -b $(go env GOPATH)/bin ${YAEGI_VERSION}
