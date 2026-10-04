@@ -18,7 +18,7 @@ experimental:
   plugins:
     logger:
       moduleName: github.com/gabay/logger
-      version: v0.1.0
+      version: v0.1.1
 ```
 
 ### Dynamic configuration
@@ -43,6 +43,9 @@ http:
           trustedForwarders: [10.0.0.0/8, 192.0.2.1]
           # Optional: entries buffered per file before new ones are dropped.
           queueSize: 8192
+          # Optional: streaming requests skip status recording so they are flushed live.
+          detectStreaming: true      # default: Server-Sent Events and gRPC
+          streamingPaths: [/events/] # default: none
           # Optional: without a rotate section the file is never rotated.
           rotate:
             schedule: "0 0 * * *" # default: daily at midnight
@@ -56,6 +59,8 @@ http:
 | `format`                | no       | `Default()`  | Line format, see [Format](#format). |
 | `trustedForwarders`     | no       | none         | IP addresses and CIDR ranges of proxies in front of Traefik, used by `{.ClientIp}`. See [Client IP](#client-ip). |
 | `queueSize`             | no       | `8192`       | Entries buffered per file between requests and the writer, 1 to 1048576. When it is full, entries are dropped (and counted) instead of delaying responses. Set once per file: a different value from a reload is ignored (and reported) until Traefik restarts. |
+| `detectStreaming`       | no       | `true`       | Detects streaming requests: Server-Sent Events (`Accept: text/event-stream`) and gRPC (`Content-Type: application/grpc…`). See [Streaming](#streaming). |
+| `streamingPaths`        | no       | none         | Path prefixes (starting with `/`) of other streaming endpoints, e.g. `/events/`. |
 | `rotate`                | no       | disabled     | Enables rotation when present. Fields left unset use their defaults. |
 | `rotate.schedule`       | no       | `0 0 * * *`  | Cron expression: 5 fields, 7 fields (with seconds and year) or a descriptor (`@daily`, `@hourly`, `@weekly`, …). Uses the time zone of the Traefik process. |
 | `rotate.keep`           | no       | `1`          | Number of plain-text backups: `<file>.1` … `<file>.<keep>`. |
@@ -77,7 +82,7 @@ The format is a Go [`text/template`](https://pkg.go.dev/text/template) that uses
 | `{.Path}`          | Request URI as received, including the query string | `/items?page=2` |
 | `{.Protocol}`      | Request protocol | `HTTP/1.1` |
 | `{.Host}`          | Request host (`Host` header) | `example.com` |
-| `{.Status}`        | Response status code | `200` |
+| `{.Status}`        | Response status code; `-` for [streaming](#streaming) requests | `200` |
 | `{.ResponseSize}`  | `Content-Length` response header (body size in bytes); `-` when absent, e.g. for chunked or streamed responses | `2326` |
 | `{.Referer}`       | `Referer` request header | `https://example.com/` |
 | `{.UserAgent}`     | `User-Agent` request header | `curl/8.5.0` |
@@ -122,6 +127,17 @@ Since `{` starts an action, write a literal brace as a string constant: `{"{"}` 
 >       trustedIPs: ["10.0.0.0/8"]
 > ```
 
+## Streaming
+
+Yaegi has a limitation: when a plugin wraps the response writer (this plugin wraps it to record the status code), the writer Traefik gets back has lost `http.Flusher`. A streamed response wrapped that way only reaches the client when Traefik's buffer fills or the response completes. In a test with an event every second, the first event of a 3-second Server-Sent Events stream arrived after 3 s.
+
+So streaming requests are passed through **unwrapped**, and their response is flushed as it is written (the first event arrived after 1 ms in the same test):
+
+- with `detectStreaming` (the default): Server-Sent Events (`Accept: text/event-stream`) and gRPC (`Content-Type: application/grpc…`)
+- requests whose path starts with one of `streamingPaths`, for other streaming endpoints (e.g. chunked downloads or long polling)
+
+The status of these requests is unknown and logged as `-`; every other field works. When the format doesn't use `{.Status}`, no request is wrapped. WebSockets don't need any of this: `http.Hijacker` survives the wrapping.
+
 ## Rotation and retention
 
 When the schedule fires, the writer goroutine flushes the file, shifts the backups (`.1` → `.2`, …), renames the file to `<file>.1` and reopens a fresh file. Because this happens on the same goroutine that writes the log, there is no race between writing and rotating. Compressing and pruning the backups then runs in the background, so logging resumes right away. Empty files are not rotated.
@@ -147,10 +163,11 @@ Each conversion writes to a temporary file that is atomically renamed before the
 
 ## Design notes
 
-- **Request path**: the middleware captures only the values the format uses (strings are shared, not copied), wraps the response writer to record the status code, and does a non-blocking send to the writer's channel (`queueSize`, 8192 entries by default). `Write` is not wrapped: the size comes from `Content-Length`, so body writes add no interpreted calls.
+- **Request path**: the middleware captures only the values the format uses (strings are shared, not copied), wraps the response writer to record the status code (only if the format uses it, and not for [streaming](#streaming) requests), and does a non-blocking send to the writer's channel (`queueSize`, 8192 entries by default). `Write` is not wrapped: the size comes from `Content-Length`, so body writes add no interpreted calls.
 - **Writer**: a single goroutine per file builds the template data (only the fields used), executes the template into a reused buffer, and writes the result through a 64 KiB buffer. Escaping uses a `strings.Replacer`, and execution uses `text/template`, both from the standard library, which runs compiled inside Traefik while the plugin's own code is interpreted. A line whose template fails at runtime is skipped and reported, never written partially. It flushes whenever the queue is empty, so idle periods reach the disk immediately and bursts are batched. Dropped entries and write errors are reported on Traefik's error log.
 - **Compression** runs in-process with the standard library's `compress/gzip`, which runs compiled (not interpreted) code: about 380 MB/s at the default level. Faster pure-Go implementations such as `klauspost/compress` can't be used, because they import `unsafe`, which Yaegi rejects.
 - **Sharing and reloads**: Traefik calls `New` for every router and on every configuration reload, and it never closes old instances. Writers are therefore kept in a global registry, one per absolute file path and protected by a global lock. Every middleware instance that logs to the same file shares that file's writer, so there are no duplicate file handles, goroutines or concurrent rotations. The most recently applied rotation settings win. The queue size is fixed when the writer is created.
+- **Idle files are closed**: a writer that received no entries for 5 to 10 minutes closes its file, and the next entry reopens it (recreating the directory if needed). This releases the file handles of paths that a reload stopped using. External tools can also move an idle log away, and logging continues in a new file. A scheduled rotation still happens while the file is closed.
 
 ### Performance
 
@@ -158,7 +175,7 @@ Plugin code is interpreted by Yaegi, so native benchmarks are misleading. Measur
 
 | | Under Yaegi | Native |
 |---|---|---|
-| Added to each request (`ServeHTTP`) | ~3.9 µs | ~0.1 µs |
+| Added to each request (`ServeHTTP`, including streaming detection) | ~4.2 µs | ~0.1 µs |
 | Writer: format and buffer one default-format line | ~25 µs (~40k lines/s per file) | ~3.5 µs |
 | Writer: `{.ClientIp}` resolution with trusted forwarders (`BenchmarkFormatClientIp`, compared with `BenchmarkFormat`) | ~+16 µs per line | |
 
@@ -166,9 +183,9 @@ Entries beyond the writer's throughput are dropped (and reported) rather than sl
 
 ### Known limitations
 
-- **Streaming responses aren't flushed early.** When Yaegi hands an interpreted `http.ResponseWriter` wrapper to Traefik, it only exposes `http.Hijacker`; `http.Flusher` and `Unwrap` are lost. WebSockets work, but streamed responses (such as SSE) are delivered when Traefik's response buffer fills or the response completes. This affects every Yaegi plugin that wraps the response writer.
+- **No status for streaming requests.** Requests detected as streaming are logged with `{.Status}` as `-` (see [Streaming](#streaming)). Streaming endpoints that aren't detected (neither Server-Sent Events nor gRPC, and not under `streamingPaths`) are buffered.
 - **Queued entries can be lost on shutdown.** Traefik gives plugins no shutdown hook. Entries still queued at shutdown may be lost, although the writer flushes as soon as its queue is empty.
-- **Old writers stay open.** If a reload changes `file`, the writer for the old path stays open (but idle) until Traefik restarts.
+- **Old writers keep a goroutine.** If a reload changes `file`, the writer for the old path closes its file once idle, but its goroutine and timers remain until Traefik restarts.
 
 ## Development
 

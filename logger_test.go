@@ -102,6 +102,7 @@ func TestNew_InvalidConfig(t *testing.T) {
 		},
 		{name: "negative queue size", cfg: &Config{File: file, QueueSize: -1}, wantErr: "queueSize -1 must be between 1 and"},
 		{name: "huge queue size", cfg: &Config{File: file, QueueSize: MaxQueueSize + 1}, wantErr: "must be between 1 and"},
+		{name: "relative streaming path", cfg: &Config{File: file, StreamingPaths: []string{"events"}}, wantErr: `streaming path "events" must start with /`},
 		{
 			name:    "bad schedule",
 			cfg:     &Config{File: file, Rotate: &RotateConfig{Schedule: "every day"}},

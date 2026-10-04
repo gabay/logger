@@ -16,6 +16,12 @@ testData:
     - 10.0.0.0/8
   # (optional) Entries buffered per file before new ones are dropped.
   queueSize: 8192
+  # (optional) Streaming requests (Server-Sent Events, gRPC, and paths under
+  # streamingPaths) are not wrapped, so they are flushed live; their
+  # {.Status} is "-". detection is on by default.
+  detectStreaming: true
+  streamingPaths:
+    - /events/
   # (optional) Rotation configuration; when present it defaults to daily at midnight,
   # keeping 1 plain-text file and 0 compressed files.
   rotate:

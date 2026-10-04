@@ -62,6 +62,19 @@ type Config struct {
 	// [DefaultQueueSize]; at most [MaxQueueSize]. The queue is created with
 	// the writer of a file, so changing it takes effect on Traefik restart.
 	QueueSize int `json:"queueSize,omitempty"`
+	// DetectStreaming passes streaming requests (Server-Sent Events, i.e.
+	// "Accept: text/event-stream", and gRPC, i.e. "Content-Type:
+	// application/grpc...") to the next handler without wrapping the
+	// response writer, so that their responses are flushed as they are
+	// written. Their {.Status} is then "-". Nil means true.
+	//
+	// Yaegi drops http.Flusher from response writers wrapped by plugins, so
+	// a wrapped streaming response would only reach the client when
+	// Traefik's buffer fills or the response completes.
+	DetectStreaming *bool `json:"detectStreaming,omitempty"`
+	// StreamingPaths lists path prefixes (e.g. "/events/") of other
+	// streaming endpoints, handled like the requests of DetectStreaming.
+	StreamingPaths []string `json:"streamingPaths,omitempty"`
 }
 
 // RotateConfig configures scheduled log rotation.
@@ -88,10 +101,11 @@ func CreateConfig() *Config {
 
 // Middleware is the access log middleware returned by [New].
 type Middleware struct {
-	next   http.Handler
-	name   string
-	format *format
-	writer *fileWriter
+	next      http.Handler
+	name      string
+	format    *format
+	writer    *fileWriter
+	streaming streaming
 }
 
 // New creates the access log middleware.
@@ -113,17 +127,12 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		return nil, fmt.Errorf("logger: resolving file %q: %w", config.File, err)
 	}
 
-	layout := config.Format
-	if layout == "" {
-		layout = Default()
-	}
-
-	trusted, err := parseTrustedForwarders(config.TrustedForwarders)
+	compiled, err := compileFormat(config)
 	if err != nil {
 		return nil, fmt.Errorf("logger: %w", err)
 	}
 
-	compiled, err := parseFormat(layout, trusted)
+	stream, err := newStreaming(config)
 	if err != nil {
 		return nil, fmt.Errorf("logger: %w", err)
 	}
@@ -146,7 +155,23 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		return nil, fmt.Errorf("logger: %w", err)
 	}
 
-	return &Middleware{next: next, name: name, format: compiled, writer: writer}, nil
+	return &Middleware{next: next, name: name, format: compiled, writer: writer, streaming: stream}, nil
+}
+
+// compileFormat compiles the format of config ([Default] when empty) with
+// its trusted forwarders.
+func compileFormat(config *Config) (*format, error) {
+	layout := config.Format
+	if layout == "" {
+		layout = Default()
+	}
+
+	trusted, err := parseTrustedForwarders(config.TrustedForwarders)
+	if err != nil {
+		return nil, err
+	}
+
+	return parseFormat(layout, trusted)
 }
 
 // resolveQueueSize applies the default to an unset (zero) queue size and
@@ -203,11 +228,19 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		e.realIP = headerValue(req.Header, "X-Real-Ip")
 	}
 
-	rec := &responseRecorder{ResponseWriter: rw}
-	m.next.ServeHTTP(rec, req)
+	// The response writer is only wrapped to record the status code. It is
+	// passed through unwrapped when the format does not use the status, and
+	// for streaming requests, which need http.Flusher (lost by Yaegi on
+	// wrapped writers): their status stays 0 and is logged as "-".
+	if used.status && !isStreaming(&m.streaming, req) {
+		rec := &responseRecorder{ResponseWriter: rw}
+		m.next.ServeHTTP(rec, req)
+		e.status = rec.statusCode()
+	} else {
+		m.next.ServeHTTP(rw, req)
+	}
 
 	e.duration = time.Since(e.start)
-	e.status = rec.statusCode()
 	// The response size is taken from Content-Length rather than by counting
 	// written bytes: wrapping Write would put an interpreted call on every
 	// body write under Yaegi.

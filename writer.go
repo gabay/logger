@@ -16,6 +16,14 @@ const (
 	// bufferSize is the size of the in-memory write buffer of a log file.
 	bufferSize = 64 << 10
 
+	// idleCheckInterval is how often the writer checks for inactivity: a
+	// file that received no entries during a whole interval is closed, so
+	// it is closed after one to two intervals without traffic, and reopened
+	// by the next entry. This releases the handles of files no longer used
+	// after a configuration reload (Traefik never closes old middlewares),
+	// and lets external tools move an idle log away.
+	idleCheckInterval = 5 * time.Minute
+
 	fileMode = 0o644
 	dirMode  = 0o755
 )
@@ -89,6 +97,9 @@ type fileWriter struct {
 	bg sync.WaitGroup
 
 	// Owned by the writer goroutine.
+	//
+	// file is nil while the file is closed for inactivity; size then keeps
+	// the last known size.
 	file     *os.File
 	buf      *bufio.Writer
 	size     int64
@@ -97,7 +108,9 @@ type fileWriter struct {
 	timer    *time.Timer
 	timerC   <-chan time.Time
 	next     time.Time
-	lastErr  string
+	// active records that entries were written since the last idle check.
+	active  bool
+	lastErr string
 	// lastFormatErr deduplicates template execution error reports.
 	lastFormatErr string
 	closeErr      error
@@ -221,6 +234,9 @@ func (w *fileWriter) run() {
 
 	w.setSchedule(w.schedule)
 
+	idle := time.NewTicker(idleCheckInterval)
+	defer idle.Stop()
+
 	for {
 		select {
 		case e := <-w.entries:
@@ -233,6 +249,8 @@ func (w *fileWriter) run() {
 			}
 		case now := <-w.timerC:
 			w.onTimer(now)
+		case <-idle.C:
+			w.onIdleCheck()
 		case fn := <-w.control:
 			fn()
 		case <-w.quit:
@@ -242,8 +260,15 @@ func (w *fileWriter) run() {
 	}
 }
 
-// write formats e into the file buffer.
+// write formats e into the file buffer, reopening the file if it was closed
+// for inactivity.
 func (w *fileWriter) write(e *entry) {
+	if w.file == nil && !w.reopen() {
+		return
+	}
+
+	w.active = true
+
 	// Execute into a separate buffer so that a failing template (e.g. a
 	// runtime error in a user action) never leaves a partial line in the file.
 	w.line.Reset()
@@ -265,6 +290,64 @@ func (w *fileWriter) write(e *entry) {
 	if err != nil {
 		w.resetBuffer(err)
 	}
+}
+
+// onIdleCheck closes the file if no entry was written since the previous
+// check.
+func (w *fileWriter) onIdleCheck() {
+	if w.active {
+		w.active = false
+		return
+	}
+
+	w.closeIdle()
+}
+
+// closeIdle flushes and closes the file; the next entry reopens it.
+func (w *fileWriter) closeIdle() {
+	if w.file == nil {
+		return
+	}
+
+	w.flush()
+
+	if err := w.file.Close(); err != nil {
+		logError(fmt.Sprintf("closing idle %s: %v", w.path, err))
+	}
+
+	w.file = nil
+}
+
+// reopen opens the file closed by closeIdle, recreating its directory if it
+// was removed meanwhile. On failure, the error is reported (once until a
+// write succeeds) and the entry being written is dropped; the next entry
+// retries.
+func (w *fileWriter) reopen() bool {
+	err := os.MkdirAll(filepath.Dir(w.path), dirMode)
+
+	var (
+		file *os.File
+		size int64
+	)
+
+	if err == nil {
+		file, size, err = openLogFile(w.path)
+	}
+
+	if err != nil {
+		if msg := err.Error(); msg != w.lastErr {
+			w.lastErr = msg
+			logError(fmt.Sprintf("reopening %s: %v", w.path, err))
+		}
+
+		return false
+	}
+
+	w.file = file
+	w.size = size
+	w.buf.Reset(file)
+
+	return true
 }
 
 // flush writes buffered data to the file and reports dropped entries.
@@ -341,6 +424,14 @@ func (w *fileWriter) onTimer(now time.Time) {
 // reopens the log file. Compression and pruning then run in the background so
 // that logging resumes immediately. Empty files are not rotated.
 func (w *fileWriter) rotate() {
+	if w.file == nil {
+		// Closed for inactivity: the file may have been changed meanwhile.
+		w.size = 0
+		if info, err := os.Stat(w.path); err == nil {
+			w.size = info.Size()
+		}
+	}
+
 	if w.size == 0 {
 		return
 	}
@@ -380,16 +471,19 @@ func (w *fileWriter) rotate() {
 }
 
 // rotateLocked performs the renames of a rotation, keeping at most total
-// backups, and reopens the log file. The caller must hold w.maint. The file
-// is always reopened, even on error, so that logging continues.
+// backups, and reopens the log file. The caller must hold w.maint. If the
+// file cannot be reopened, the next entry retries.
 func (w *fileWriter) rotateLocked(total int) error {
-	errs := []error{w.file.Close()}
+	var errs []error
+	if w.file != nil {
+		errs = append(errs, w.file.Close())
+		w.file = nil
+	}
+
 	errs = append(errs, shiftBackups(w.path, total)...)
 
 	file, size, err := openLogFile(w.path)
 	if err != nil {
-		// Keep the closed file: writes fail and get reported until the next
-		// successful rotation.
 		return errors.Join(append(errs, err)...)
 	}
 
@@ -409,7 +503,10 @@ func (w *fileWriter) shutdown() {
 
 	w.drain()
 	w.bg.Wait()
-	w.closeErr = w.file.Close()
+
+	if w.file != nil {
+		w.closeErr = w.file.Close()
+	}
 }
 
 // drain writes every queued entry and flushes. It must run on the writer goroutine.

@@ -66,7 +66,8 @@ type Fields struct {
 	Protocol string
 	// Host is the request host (Host header or URL host).
 	Host string
-	// Status is the response status code, e.g. 200.
+	// Status is the response status code, e.g. 200. It is "-" for streaming
+	// requests (see Config.DetectStreaming), whose status is not recorded.
 	Status string
 	// ResponseSize is the Content-Length response header, i.e. the size of
 	// the response body in bytes. It is "-" when the header is absent, e.g.
@@ -267,7 +268,7 @@ type entry struct {
 // all-"-" values and escapes non-empty strings with escaper.Replace inline,
 // and it skips the values the format does not use.
 //
-//nolint:gocyclo,cyclop // one flat branch per field: helpers would add interpreted calls.
+//nolint:gocyclo,cyclop,gocognit // one flat branch per field: helpers would add interpreted calls.
 func (e *entry) fields() *Fields {
 	used := &e.format.used
 	data := &Fields{
@@ -314,7 +315,7 @@ func (e *entry) fields() *Fields {
 		data.Host = escaper.Replace(e.host)
 	}
 
-	if used.status {
+	if used.status && e.status > 0 {
 		data.Status = strconv.Itoa(e.status)
 	}
 
